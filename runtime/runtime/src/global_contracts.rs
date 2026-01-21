@@ -21,22 +21,27 @@ use near_vm_runner::{ContractCode, precompile_contract};
 use crate::congestion_control::ReceiptSink;
 use crate::{ActionResult, ApplyState, clear_account_contract_storage_usage};
 
-pub(crate) fn action_deploy_global_contract(
+/// Check how much the global contract will cost to store. If the account
+/// has enough gas, initiate the distribution. Else, return an error.
+pub(crate) fn action_deploy_global_contract( // RELEVANT
     account: &mut Account,
     account_id: &AccountId,
     apply_state: &ApplyState,
     deploy_contract: &DeployGlobalContractAction,
+    epoch_info_provider: &dyn EpochInfoProvider,
     result: &mut ActionResult,
     stats: &mut ChunkApplyStatsV0,
 ) -> Result<(), RuntimeError> {
     let _span = tracing::debug_span!(target: "runtime", "action_deploy_global_contract").entered();
 
+    // How much will this global contract cost to store
     let storage_cost = apply_state
         .config
         .fees
         .storage_usage_config
         .global_contract_storage_amount_per_byte
         .saturating_mul(deploy_contract.code.len() as u128);
+    // Validate whether the account has requisite balance to store the contract
     let Some(updated_balance) = account.amount().checked_sub(storage_cost) else {
         result.result = Err(ActionErrorKind::LackBalanceForState {
             account_id: account_id.clone(),
@@ -53,9 +58,10 @@ pub(crate) fn action_deploy_global_contract(
         account_id.clone(),
         deploy_contract.code.clone(),
         &deploy_contract.deploy_mode,
-        apply_state.shard_id,
+        apply_state,
+        epoch_info_provider,
         result,
-    );
+    )?;
 
     Ok(())
 }
@@ -153,9 +159,10 @@ fn initiate_distribution(
     account_id: AccountId,
     contract_code: Arc<[u8]>,
     deploy_mode: &GlobalContractDeployMode,
-    current_shard_id: ShardId,
+    apply_state: &ApplyState,
+    epoch_info_provider: &dyn EpochInfoProvider,
     result: &mut ActionResult,
-) {
+) -> Result<(), RuntimeError> {
     let id = match deploy_mode {
         GlobalContractDeployMode::CodeHash => {
             GlobalContractIdentifier::CodeHash(hash(&contract_code))
@@ -164,18 +171,25 @@ fn initiate_distribution(
             GlobalContractIdentifier::AccountId(account_id.clone())
         }
     };
+    let shard_layout = epoch_info_provider.shard_layout(&apply_state.epoch_id)?;
+    let target_shard_id = shard_layout
+        .shard_ids()
+        .next()
+        .expect("Shard layout must contain at least one shard");
     let distribution_receipts = Receipt::new_global_contract_distribution(
         account_id,
         GlobalContractDistributionReceipt::new(
             id,
             // We can start with any shard, using the current one just for convenience
-            current_shard_id,
+            target_shard_id,
             vec![],
             contract_code,
         ),
     );
     // No need to set receipt_id here, it will be generated as part of apply_action_receipt
     result.new_receipts.push(distribution_receipts);
+
+    Ok(())
 }
 
 fn apply_distribution_current_shard(
@@ -184,6 +198,7 @@ fn apply_distribution_current_shard(
     apply_state: &ApplyState,
     state_update: &mut TrieUpdate,
 ) {
+    tracing::info!("[NANDAN DBUG]");
     let config = apply_state.config.wasm_config.clone();
     let trie_key = TrieKey::GlobalContractCode {
         identifier: match &global_contract_data.id() {
@@ -208,7 +223,7 @@ fn apply_distribution_current_shard(
     );
 }
 
-fn forward_distribution_next_shard(
+fn forward_distribution_next_shard( // Extremely Relevant
     receipt: &Receipt,
     global_contract_data: &GlobalContractDistributionReceipt,
     apply_state: &ApplyState,

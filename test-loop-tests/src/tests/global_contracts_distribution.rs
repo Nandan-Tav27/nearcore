@@ -10,8 +10,11 @@ use near_primitives::action::{GlobalContractDeployMode, GlobalContractIdentifier
 use near_primitives::epoch_manager::EpochConfigStore;
 use near_primitives::receipt::ReceiptEnum;
 use near_primitives::shard_layout::ShardLayout;
+use near_primitives::test_utils::create_user_test_signer;
+use near_primitives::transaction::SignedTransaction;
 use near_primitives::types::{AccountId, Balance, BlockHeight, BlockHeightDelta};
 use near_primitives::version::PROTOCOL_VERSION;
+use near_primitives_core::gas::Gas;
 use near_vm_runner::ContractCode;
 
 use crate::setup::builder::TestLoopBuilder;
@@ -21,7 +24,7 @@ use crate::utils::account::{
 };
 use crate::utils::node::TestLoopNode;
 use crate::utils::setups::derive_new_epoch_config_from_boundary;
-use crate::utils::transactions::{check_txs, deploy_global_contract, use_global_contract};
+use crate::utils::transactions::{check_txs, deploy_global_contract, get_shared_block_hash, submit_tx, use_global_contract};
 
 const EPOCH_LENGTH: BlockHeightDelta = 5;
 
@@ -114,6 +117,139 @@ fn test_global_receipt_distribution_at_resharding_boundary() {
     env.shutdown();
 }
 
+#[test]
+/// If multiple global contract distributions are triggered around the resharding boundary,
+/// we could have a scenario where two receipts(one meant to update the other) reach a
+/// shard at the same height.
+fn test_multiple_global_receipt_distribution_at_resharding_boundary() {
+    init_test_logger();
+    let mut env = GlobalContractsReshardingTestEnv::setup();
+    let expected_new_shard_layout_height = EPOCH_LENGTH * 2 + 2;
+    // This height is picked so that the first global contract distribution receipt reaches
+    // shard that is being split at the first height after the resharding
+    let send_deploy_tx_height = expected_new_shard_layout_height - 3;
+
+    env.run_until_head_height(send_deploy_tx_height);
+    assert_eq!(env.current_shard_layout(), env.base_shard_layout);
+
+    // Deploying global contract with the user from the split shard.
+    // The first target shard for the global contract distribution receipt
+    // is user's shard, this way we ensure that we hit the shard that is
+    // split at resharding.
+    let deploy_user = env.users[0].clone();
+    assert!(
+        !env.new_shard_layout
+            .shard_ids()
+            .contains(&env.base_shard_layout.account_id_to_shard_id(&deploy_user)),
+        "expected deploy user to be in the split shard"
+    );
+    let code = ContractCode::new(near_test_contracts::trivial_contract().to_vec(), None);
+    let deploy_invalid_global_contract = deploy_global_contract(
+        &mut env.env.test_loop,
+        &env.env.node_datas,
+        &env.chunk_producer,
+        deploy_user.clone(),
+        code.code().to_vec(),
+        1,
+        GlobalContractDeployMode::AccountId,
+    );
+
+    env.run_for_number_of_blocks(1);
+    let code = ContractCode::new(near_test_contracts::rs_contract().to_vec(), None);
+    let deploy_valid_global_contract = deploy_global_contract(
+        &mut env.env.test_loop,
+        &env.env.node_datas,
+        &env.chunk_producer,
+        deploy_user.clone(),
+        code.code().to_vec(),
+        2,
+        GlobalContractDeployMode::AccountId,
+    );
+
+    env.run_until_head_height(expected_new_shard_layout_height);
+    check_txs(
+        &mut env.env.test_loop.data,
+        &env.env.node_datas,
+        &env.chunk_producer,
+        &[deploy_valid_global_contract]
+    );
+    assert_eq!(env.current_shard_layout(), env.new_shard_layout);
+
+    // // Verify that global contract distribution receipt has target shard from the old shard layout,
+    // // while its block has the new layout.
+    // {
+    //     let block =
+    //         env.client().chain.get_block_by_height(expected_new_shard_layout_height).unwrap();
+    //     let block_shard_layout = env
+    //         .client()
+    //         .epoch_manager
+    //         .get_epoch_config(block.header().epoch_id())
+    //         .unwrap()
+    //         .shard_layout;
+    //     assert_eq!(block_shard_layout, env.new_shard_layout);
+    //     let chunks = block.chunks();
+    //     // Expect new chunk
+    //     assert!(chunks[0].is_new_chunk(block.header().height()));
+    //     let chunk = env.client().chain.get_chunk(&chunks[0].compute_hash()).unwrap();
+    //     let [distribution_receipt] = chunk
+    //         .prev_outgoing_receipts()
+    //         .iter()
+    //         .filter_map(|r| match r.receipt() {
+    //             ReceiptEnum::GlobalContractDistribution(r) => Some(r),
+    //             _ => None,
+    //         })
+    //         .collect_vec()[..]
+    //     else {
+    //         panic!("Expected exactly one global contract distribution receipt");
+    //     };
+    //     let target_shard = distribution_receipt.target_shard();
+    //     assert!(!block_shard_layout.shard_ids().contains(&target_shard));
+    // };
+    //
+    // Wait for the distribution to reach all shards.
+    env.env.test_loop.run_for(Duration::seconds(3));
+    //
+    // Check that users on all shards in the new layout can use the contract.
+    let mut use_txs = vec![];
+    for user in &env.users {
+        let use_tx = use_global_contract(
+            &mut env.env.test_loop,
+            &env.env.node_datas,
+            &env.chunk_producer,
+            user.clone(),
+            3,
+            GlobalContractIdentifier::AccountId(deploy_user.clone()),
+        );
+        use_txs.push(use_tx);
+    }
+    env.env.test_loop.run_for(Duration::seconds(2));
+    check_txs(&mut env.env.test_loop.data, &env.env.node_datas, &env.chunk_producer, &use_txs);
+
+    let mut call_txs = vec![];
+    for user in &env.users {
+        let signer = create_user_test_signer(user);
+        let call_tx = SignedTransaction::call(
+            4,
+            user.clone(),
+            user.clone(),
+            &signer,
+            Balance::ZERO,
+            "log_something".to_owned(),
+            vec![],
+            Gas::from_teragas(300),
+            get_shared_block_hash(&env.env.node_datas, &env.env.test_loop.data),
+        );
+        let tx_hash = call_tx.get_hash();
+        submit_tx(&env.env.node_datas, &env.chunk_producer, call_tx);
+        call_txs.push(tx_hash);
+    }
+
+    env.env.test_loop.run_for(Duration::seconds(3));
+    check_txs(&mut env.env.test_loop.data, &env.env.node_datas, &env.chunk_producer, &call_txs);
+
+    env.shutdown();
+}
+
 struct GlobalContractsReshardingTestEnv {
     env: TestLoopEnv,
     base_shard_layout: ShardLayout,
@@ -171,6 +307,11 @@ impl GlobalContractsReshardingTestEnv {
     fn run_until_head_height(&mut self, height: BlockHeight) {
         TestLoopNode::for_account(&self.env.node_datas, &self.chunk_producer)
             .run_until_head_height(&mut self.env.test_loop, height);
+    }
+
+    fn run_for_number_of_blocks(&mut self, num_blocks: usize) {
+        TestLoopNode::for_account(&self.env.node_datas, &self.chunk_producer)
+            .run_for_number_of_blocks(&mut self.env.test_loop, num_blocks);
     }
 
     fn client(&self) -> &Client {

@@ -51,6 +51,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::ops::Deref;
 use std::sync::Arc;
+use itertools::Itertools;
 use utils::{check_transaction_validity_period, early_prepare_txs_check_validity_period};
 
 pub mod latest_witnesses;
@@ -459,10 +460,12 @@ impl ChainStore {
         let split_shard_ids =
             split_shard_ids.ok_or(Error::InvalidSplitShardsIds(shard_id, receipts_shard_id))?;
 
-        // The target shard id is the split shard with the lowest shard id.
-        let target_shard_id = split_shard_ids.iter().min();
-        let target_shard_id =
-            *target_shard_id.ok_or(Error::InvalidSplitShardsIds(shard_id, receipts_shard_id))?;
+        // The target shard id is the split shard that falls first in the shard layout
+        let target_shard_id = shard_layout
+            .shard_ids()
+            .find(|shard_id| split_shard_ids.contains(shard_id))
+            .ok_or(Error::InvalidSplitShardsIds(shard_id, receipts_shard_id))?;
+
 
         if shard_id == target_shard_id {
             // This shard_id is the lowest index child, it gets all the receipts.

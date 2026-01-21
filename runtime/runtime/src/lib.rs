@@ -424,6 +424,7 @@ impl Runtime {
                     account_id,
                     apply_state,
                     deploy_global_contract,
+                    epoch_info_provider,
                     &mut result,
                     stats,
                 )?;
